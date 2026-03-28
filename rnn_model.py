@@ -1,8 +1,6 @@
 """
-RNN for Delayed Match-to-Sample with Distractors (Neuro 120)
-
-Trains a vanilla RNN on a working memory task where the network must
-remember a stimulus, ignore a distractor, and decide if a test stimulus
+This is kind of a proof of concept vanilla test RNN that trains on a working memory task where the network must
+remember a stimulus, ignore a distractor (simple distractor as of now), and decide if a test stimulus
 matches the original. 
 """
 
@@ -11,37 +9,35 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from neurogym.envs.delaymatchsample import DelayMatchSampleDistractor1D
+# used from NeuroGym: pre-built neuroscience experiment that handles trial
+# structure and encodes stimuli using cosine tuning curves across 32
+# channels, which mimics how real neurons represent orientation
 
-
-# Data generation (uses NeuroGym)
-
-def generate_trials(num_trials=1000, distractor_strength=1.0, seed=42):
+def generate_trials(num_trials=1000, distractor_strength=1.0):
     """Generate trials for the memory task using NeuroGym."""
 
-    # from NeuroGym: pre-built neuroscience experiment that handles trial
-    # structure and encodes stimuli using cosine tuning curves across 32
-    # channels, mimicking how real neurons represent orientation
-    from neurogym.envs.delaymatchsample import DelayMatchSampleDistractor1D
-
+    seed = 42 # 67 
     rng = np.random.RandomState(seed)
-    env = DelayMatchSampleDistractor1D(dt=20)  # each timestep = 20ms
+    env = DelayMatchSampleDistractor1D(dt=20) # dt determines how long each delay / test period is (the test is like fixation + sample + delay1 + test1 + delay2 + test2 + delay3 + test3)
+    # also, the sample here is Unif(0, 2pi) and is the angle of the stimulus
+    # fixation tells the network to stay still and not respond yet
 
     all_inputs = []
     all_labels = []
 
     for _ in range(num_trials):
-        # NeuroGym generates one complete trial with random stimulus
         env.new_trial()
-
-        # env.ob (from NeuroGym): network input at each timestep, shape (T, 33)
-        #   column 0 = fixation signal, columns 1-32 = population-coded stimulus
-        # env.gt (from NeuroGym): correct label at each timestep, shape (T,)
-        #   0 = do nothing, 1 = match
+        # reminder of format:
+        # env.ob: network input at each timestep, shape (T, 33)
+        # column 0 = fixation signal, columns 1-32 = population-coded stimulus
+        # env.gt: correct label at each timestep, shape (T,)
+        # 0 = do nothing, 1 = match
         all_inputs.append(env.ob.copy())
         all_labels.append(env.gt.copy())
 
-    X = np.stack(all_inputs)  # (num_trials, T, 33)
-    Y = np.stack(all_labels)  # (num_trials, T)
+    X = np.stack(all_inputs) # (num_trials, T, 33)
+    Y = np.stack(all_labels) # (num_trials, T)
     return X, Y
 
 
@@ -59,13 +55,12 @@ class TrialDataset(Dataset):
         return self.X[idx], self.Y[idx]
 
 
-# Model definition
-
+# one forward pass through the RNN performs one working memory matching task
 class VanillaRNN(nn.Module):
     """
-    Simple recurrent neural network: Input (33) -> 64 recurrent neurons -> Decision (2)
+    Input = 33 -> 64 recurrent neurons -> Decision (2)
 
-    We use a vanilla RNN (not LSTM/GRU) so the recurrent weight matrix W_hh
+    We use a vanilla RNN (not more advanced versions like LSTM) so the recurrent weight matrix W_hh
     directly represents neuron-to-neuron connection strengths, making it easy
     to analyze like a biological wiring diagram. 64 hidden units is standard
     in computational neuroscience it appears and is not super hard to study.
@@ -74,10 +69,9 @@ class VanillaRNN(nn.Module):
     def __init__(self, input_size=33, hidden_size=64, output_size=2):
         super().__init__()
         self.hidden_size = hidden_size
-
         # Recurrent layer with two weight matrices:
-        #   W_ih: input-to-neuron connections (33 x 64)
-        #   W_hh: neuron-to-neuron connections (64 x 64), our main analysis target
+        # W_ih: input-to-neuron connections (33 x 64)
+        # W_hh: neuron-to-neuron connections (64 x 64), our main analysis target
         self.rnn = nn.RNN(
             input_size=input_size,
             hidden_size=hidden_size,
@@ -86,7 +80,7 @@ class VanillaRNN(nn.Module):
             batch_first=True,
         )
 
-        # Readout layer: reads population activity, outputs a decision
+        # readout layer reads population activity, outputs a decision
         self.readout = nn.Linear(hidden_size, output_size)
 
     def forward(self, x, h0=None):
@@ -97,7 +91,6 @@ class VanillaRNN(nn.Module):
 
 
 # Training
-
 def train_model(
     model, train_loader, val_loader=None, num_epochs=50, learning_rate=1e-3,
     checkpoint_dir='checkpoints', checkpoint_every=10, device='cpu',
@@ -113,7 +106,7 @@ def train_model(
         weight=class_weights.to(device) if class_weights is not None else None
     )
 
-    # Adam optimizer
+    # we use default Adam optimizer for now
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     history = {
@@ -135,16 +128,15 @@ def train_model(
             inputs_batch = inputs_batch.to(device)
             labels_batch = labels_batch.to(device)
 
-            # Forward pass
+            # forward pass
             predictions, _ = model(inputs_batch)
 
-            # Compute loss
             loss = loss_function(
                 predictions.reshape(-1, predictions.size(-1)),
                 labels_batch.reshape(-1),
             )
 
-            # Backward pass
+            # backward pass
             optimizer.zero_grad()
             loss.backward()
 
@@ -159,7 +151,7 @@ def train_model(
             correct += (predicted_classes == labels_batch).sum().item()
             total += labels_batch.numel()
 
-            # Track decision accuracy separately (the metric that matters)
+            #  decision accuracy 
             is_decision = (labels_batch == 1)
             if is_decision.any():
                 dec_correct += (predicted_classes[is_decision] == 1).sum().item()
@@ -246,7 +238,7 @@ def evaluate(model, loader, loss_function, device='cpu'):
     return avg_loss, accuracy, dec_accuracy
 
 
-# Hidden state extraction (for analysis)
+# Hidden state extraction for analysis
 
 def extract_hidden_states(model, X, device='cpu'):
     """Run the trained model and record all 64 neurons' activity over time."""
@@ -260,7 +252,7 @@ def extract_hidden_states(model, X, device='cpu'):
 # Main
 
 def main():
-    # Settings
+    # Settings for hyperparameters
     NUM_TRAIN_TRIALS = 2000
     NUM_VAL_TRIALS = 400
     BATCH_SIZE = 64
@@ -280,9 +272,9 @@ def main():
         distractor_strength=DISTRACTOR_STRENGTH,
         seed=42,
     )
-    print(f"  Input shape:  {X_train.shape}")
-    print(f"  Labels shape: {Y_train.shape}")
-    print(f"  Unique labels: {np.unique(Y_train)}")
+    print(f"Input shape:  {X_train.shape}")
+    print(f"Labels shape: {Y_train.shape}")
+    print(f"Unique labels: {np.unique(Y_train)}")
 
     print("Generating validation trials...")
     X_val, Y_val = generate_trials(
@@ -331,9 +323,9 @@ def main():
     # Extract hidden states for later analysis (PCA, stability, etc.)
     print("\nExtracting hidden states from trained model...")
     hidden_states = extract_hidden_states(model, X_val[:50], device=DEVICE)
-    print(f"  Hidden states shape: {hidden_states.shape}")
+    print(f"Hidden states shape: {hidden_states.shape}")
     np.save(os.path.join(checkpoint_dir, 'hidden_states_val.npy'), hidden_states)
-    print(f"  Saved to {checkpoint_dir}/hidden_states_val.npy")
+    print(f"Saved to {checkpoint_dir}/hidden_states_val.npy")
 
     # Save training history for plotting learning curves
     np.savez(
