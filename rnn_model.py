@@ -9,35 +9,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from neurogym.envs.delaymatchsample import DelayMatchSampleDistractor1D
-# used from NeuroGym: pre-built neuroscience experiment that handles trial
-# structure and encodes stimuli using cosine tuning curves across 32
-# channels, which mimics how real neurons represent orientation
+from tasks.poisson_dms import generate_trials as _generate_trials
 
-def generate_trials(num_trials=1000, distractor_strength=1.0):
-    """Generate trials for the memory task using NeuroGym."""
 
-    seed = 42 # 67 
-    rng = np.random.RandomState(seed)
-    env = DelayMatchSampleDistractor1D(dt=20) # dt determines how long each delay / test period is (the test is like fixation + sample + delay1 + test1 + delay2 + test2 + delay3 + test3)
-    # also, the sample here is Unif(0, 2pi) and is the angle of the stimulus
-    # fixation tells the network to stay still and not respond yet
+def generate_trials(num_trials=1000, lam=0.0, seed=42):
+    """Generate trials using the custom Poisson distractor DMS task.
 
-    all_inputs = []
-    all_labels = []
-
-    for _ in range(num_trials):
-        env.new_trial()
-        # reminder of format:
-        # env.ob: network input at each timestep, shape (T, 33)
-        # column 0 = fixation signal, columns 1-32 = population-coded stimulus
-        # env.gt: correct label at each timestep, shape (T,)
-        # 0 = do nothing, 1 = match
-        all_inputs.append(env.ob.copy())
-        all_labels.append(env.gt.copy())
-
-    X = np.stack(all_inputs) # (num_trials, T, 33)
-    Y = np.stack(all_labels) # (num_trials, T)
+    Continuous angles from [0, 2pi), Poisson distractors during delay.
+    Returns X (observations) and Y (labels) only, for backward compat.
+    """
+    X, Y, _ = _generate_trials(num_trials=num_trials, lam=lam, seed=seed)
     return X, Y
 
 
@@ -58,34 +39,53 @@ class TrialDataset(Dataset):
 # one forward pass through the RNN performs one working memory matching task
 class VanillaRNN(nn.Module):
     """
-    Input = 33 -> 64 recurrent neurons -> Decision (2)
+    Continuous-time RNN following Yang et al. (2019) / PsychRNN conventions:
+        h_new = (1 - alpha) * h + alpha * tanh(W_rec @ h + W_in @ x + b)
 
-    We use a vanilla RNN (not more advanced versions like LSTM) so the recurrent weight matrix W_hh
-    directly represents neuron-to-neuron connection strengths, making it easy
-    to analyze like a biological wiring diagram. 64 hidden units is standard
-    in computational neuroscience it appears and is not super hard to study.
+    where alpha = dt/tau is the leak rate. This formulation gives the network
+    a time constant that helps maintain information across delay periods,
+    unlike nn.RNN which does h_new = tanh(W_rec @ h + W_in @ x + b) and
+    completely overwrites the hidden state each step.
+
+    The recurrent weight matrix W_rec directly represents neuron-to-neuron
+    connection strengths, making it easy to analyze like a biological wiring diagram.
     """
 
-    def __init__(self, input_size=33, hidden_size=64, output_size=2):
+    def __init__(self, input_size=33, hidden_size=128, output_size=3,
+                 dt=20, tau=500, num_layers=1):
         super().__init__()
         self.hidden_size = hidden_size
-        # Recurrent layer with two weight matrices:
-        # W_ih: input-to-neuron connections (33 x 64)
-        # W_hh: neuron-to-neuron connections (64 x 64), our main analysis target
-        self.rnn = nn.RNN(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=1,
-            nonlinearity='tanh',
-            batch_first=True,
-        )
+        self.num_layers = num_layers  # kept for checkpoint compat, but only 1 layer used
+        self.alpha = dt / tau  # leak rate: smaller = more memory retention
 
-        # readout layer reads population activity, outputs a decision
+        # Weight matrices
+        self.W_in = nn.Linear(input_size, hidden_size)
+        self.W_rec = nn.Linear(hidden_size, hidden_size, bias=False)
         self.readout = nn.Linear(hidden_size, output_size)
 
+        # Orthogonal init for recurrent weights (standard for comp neuro RNNs)
+        nn.init.orthogonal_(self.W_rec.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.W_in.weight)
+        nn.init.xavier_uniform_(self.readout.weight)
+
     def forward(self, x, h0=None):
-        """Run input through the network. Returns predictions and hidden states."""
-        hidden_states, _ = self.rnn(x, h0)
+        """Run input through the network. Returns predictions and all hidden states."""
+        batch_size, seq_len, _ = x.shape
+
+        if h0 is None:
+            h = torch.zeros(batch_size, self.hidden_size, device=x.device)
+        else:
+            h = h0.squeeze(0)
+
+        hidden_states = []
+        for t in range(seq_len):
+            # Continuous-time RNN update: leaky integration
+            h = (1 - self.alpha) * h + self.alpha * torch.tanh(
+                self.W_in(x[:, t]) + self.W_rec(h)
+            )
+            hidden_states.append(h)
+
+        hidden_states = torch.stack(hidden_states, dim=1)  # (batch, time, hidden)
         predictions = self.readout(hidden_states)
         return predictions, hidden_states
 
@@ -151,10 +151,10 @@ def train_model(
             correct += (predicted_classes == labels_batch).sum().item()
             total += labels_batch.numel()
 
-            #  decision accuracy 
-            is_decision = (labels_batch == 1)
+            # Decision accuracy: check match/non-match during test periods
+            is_decision = (labels_batch >= 1)  # labels 1 (match) or 2 (non-match)
             if is_decision.any():
-                dec_correct += (predicted_classes[is_decision] == 1).sum().item()
+                dec_correct += (predicted_classes[is_decision] == labels_batch[is_decision]).sum().item()
                 dec_total += is_decision.sum().item()
 
         # Record epoch metrics
@@ -193,8 +193,8 @@ def train_model(
                 'train_acc': train_acc,
                 'val_loss': val_loss,
                 'val_acc': val_acc,
-                'W_hh': model.rnn.weight_hh_l0.detach().cpu().numpy(),
-                'W_ih': model.rnn.weight_ih_l0.detach().cpu().numpy(),
+                'W_hh': model.W_rec.weight.detach().cpu().numpy(),
+                'W_ih': model.W_in.weight.detach().cpu().numpy(),
             }
             path = os.path.join(checkpoint_dir, f'epoch_{epoch:03d}.pt')
             torch.save(checkpoint, path)
@@ -227,9 +227,9 @@ def evaluate(model, loader, loss_function, device='cpu'):
             total_correct += (predicted_classes == labels_batch).sum().item()
             total_count += labels_batch.numel()
 
-            is_decision = (labels_batch == 1)
+            is_decision = (labels_batch >= 1)  # labels 1 (match) or 2 (non-match)
             if is_decision.any():
-                dec_correct += (predicted_classes[is_decision] == 1).sum().item()
+                dec_correct += (predicted_classes[is_decision] == labels_batch[is_decision]).sum().item()
                 dec_count += is_decision.sum().item()
 
     avg_loss = total_loss / len(loader.dataset)
@@ -253,24 +253,23 @@ def extract_hidden_states(model, X, device='cpu'):
 
 def main():
     # Settings for hyperparameters
-    NUM_TRAIN_TRIALS = 2000
-    NUM_VAL_TRIALS = 400
+    NUM_TRAIN_TRIALS = 5000
+    NUM_VAL_TRIALS = 500
     BATCH_SIZE = 64
     NUM_EPOCHS = 100
-    LEARNING_RATE = 5e-4
-    HIDDEN_SIZE = 64
+    LEARNING_RATE = 1e-3
+    HIDDEN_SIZE = 128
     CHECKPOINT_EVERY = 10
-    DISTRACTOR_STRENGTH = 1.0
+    LAM = 0.0  # Poisson distractor rate (0 = no distractors)
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {DEVICE}")
+    print(f"Distractor rate (lambda): {LAM}")
 
-    # Generate data using NeuroGym
+    # Generate data using custom Poisson DMS task
     print("Generating training trials...")
     X_train, Y_train = generate_trials(
-        num_trials=NUM_TRAIN_TRIALS,
-        distractor_strength=DISTRACTOR_STRENGTH,
-        seed=42,
+        num_trials=NUM_TRAIN_TRIALS, lam=LAM, seed=42
     )
     print(f"Input shape:  {X_train.shape}")
     print(f"Labels shape: {Y_train.shape}")
@@ -278,9 +277,7 @@ def main():
 
     print("Generating validation trials...")
     X_val, Y_val = generate_trials(
-        num_trials=NUM_VAL_TRIALS,
-        distractor_strength=DISTRACTOR_STRENGTH,
-        seed=99,
+        num_trials=NUM_VAL_TRIALS, lam=LAM, seed=99,
     )
 
     # Compute class weights to handle imbalance
@@ -312,7 +309,7 @@ def main():
     print(f"\nModel architecture:\n{model}")
     print(f"Total trainable parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    checkpoint_dir = os.path.join('checkpoints', f'distractor_{DISTRACTOR_STRENGTH}')
+    checkpoint_dir = os.path.join('checkpoints', f'poisson_lam{LAM}')
     history = train_model(
         model, train_loader, val_loader=val_loader,
         num_epochs=NUM_EPOCHS, learning_rate=LEARNING_RATE,

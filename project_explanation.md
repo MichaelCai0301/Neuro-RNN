@@ -19,7 +19,7 @@ Each "trial" the network sees plays out like this:
 4. **Distractor** — While the network is trying to remember, a random irrelevant stimulus appears to throw it off. Like someone shouting a different number at you while you're trying to remember the first one.
 
 5. **Test** — A new stimulus appears. The network has to answer: "Is this the same as what I saw before?" If yes, output 1 (match). If no, output 0 (no match).
-
+e
 ### What the data actually looks like
 
 - **Inputs:** At each moment in time, the network receives 33 numbers. The first number is the "fixation signal" (1 = pay attention, 0 = make your decision). The other 32 numbers describe the stimulus using something called population coding — basically, different "sensor neurons" respond more or less strongly depending on the stimulus orientation.
@@ -119,3 +119,30 @@ After training, we extracted the network's internal activity (the hidden states)
 - `rnn_model.py` — All the code: data generation, model definition, training loop, and hidden state extraction
 - `data.ipynb` — A notebook we used to explore what the NeuroGym data looks like before building the model
 - `checkpoints/distractor_1.0/` — Saved model snapshots (every 10 epochs), extracted hidden states, and a record of how training loss and accuracy changed over time
+
+## Next Steps: Weight Matrix Extraction Across Distractor Conditions
+
+The core idea is to train a separate network for each distractor strength (e.g., 0.0, 0.5, 1.0, 1.5, 2.0) and extract the 64×64 recurrent weight matrix `W_hh` from each. Since each network is trained from a different random initialization, comparing these weight matrices requires careful methodology.
+
+### Per-Network Analysis
+
+- **Eigenvalue/SVD decomposition of W_hh:** Decompose each network's recurrent weight matrix and compare eigenvalue spectra across conditions. Key things to look at: spectral radius (largest |eigenvalue|), fraction of eigenvalues with magnitude > 1, and the distribution of eigenvalues in the complex plane. Larger spectral radii indicate stronger recurrent amplification, which may relate to distractor resistance. *(Sussillo & Barak, Neural Computation 2013)*
+- **Effective rank:** Compare how many significant singular values W_hh has across conditions. Networks handling stronger distractors may develop higher-rank or more structured connectivity.
+- **Non-normal dynamics:** Compute the Schur decomposition of W_hh. Non-normality (large off-diagonal components) drives transient amplification, which may be relevant to how the network resists or succumbs to distractors. *(Goldman, Neuron 2009)*
+- **Fixed-point analysis:** Use numerical optimization to find fixed points of the trained dynamics (where dx/dt ≈ 0), then linearize the Jacobian at each. Compare the number, stability, and geometry of fixed points across distractor conditions — this reveals whether stronger distractors change the attractor landscape. The `FixedPointFinder` library (Golub & Sussillo) provides a ready-made implementation. *(Sussillo & Barak, Neural Computation 2013)*
+
+### Across-Network Comparison
+
+Direct element-wise comparison of W_hh between separately trained networks is meaningless because neurons in different networks don't correspond to each other (the permutation invariance problem). Instead, use representation-level methods:
+
+- **Centered Kernel Alignment (CKA):** Compares hidden-state representations rather than raw weights, making it invariant to neuron permutation and orthogonal transformations. Run all networks on a shared probe stimulus set and compute CKA between their hidden activations. *(Kornblith et al., ICML 2019)*
+- **Representational Similarity Analysis (RSA):** Build representational dissimilarity matrices (RDMs) from each network's hidden-state responses to a shared stimulus set, then correlate RDMs across networks. *(Kriegeskorte et al., 2008)*
+- **Dynamical Similarity Analysis (DSA):** Directly compares the dynamical systems learned by different networks using delay embeddings, invariant to neuron permutation. This is particularly well-suited for RNNs since it compares dynamics, not just static representations. *(Ostrow et al., NeurIPS 2023)*
+- **Procrustes alignment:** Find the optimal orthogonal transformation aligning hidden states of two networks on the same inputs, then compare the aligned weight matrices. *(Williams et al., NeurIPS 2021)*
+
+### Suggested Pipeline
+
+1. Train one network per distractor condition (varying `distractor_strength`), saving W_hh at each checkpoint.
+2. Per network: compute eigenspectrum of W_hh, run fixed-point analysis, measure effective rank.
+3. Across networks: apply CKA or DSA on hidden activations to a shared probe stimulus set; compare eigenvalue spectra; compare fixed-point topology.
+4. Look for systematic trends: does increasing distractor strength lead to predictable changes in spectral radius, attractor structure, or representational geometry?
