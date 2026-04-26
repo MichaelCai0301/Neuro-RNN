@@ -1,18 +1,3 @@
-"""Matched-accuracy continuation sweep.
-
-Continues training each finetuned_lam{L}_seed{s}/epoch_030.pt until its val
-decision accuracy clears 95% for two consecutive epochs (matched-accuracy
-operating point) or a cumulative epoch cap of 150 is hit.
-
-Saves the first checkpoint that meets the target as `target95.pt`, plus the
-best-ever checkpoint as `best.pt`, and a `target_meta.npz` per run with the
-cumulative epoch at which 95% was first achieved (NaN if never).
-
-This is the matched-accuracy counterpart to the matched-effort sweep
-(finetune_sweep.py), so downstream representational analyses (fidelity decoder,
-participation ratio, RSA/Procrustes) can be run at a proficiency-controlled
-operating point.
-"""
 
 import os
 import sys
@@ -30,14 +15,14 @@ LAMBDAS = [2, 4, 6, 8, 10]
 SEEDS = [0, 1, 2]
 
 TARGET_ACC = 0.95
-TARGET_CONSECUTIVE = 2          # must clear target for this many epochs in a row
-CUMULATIVE_EPOCH_CAP = 150      # hard cap on total epochs from baseline
-START_EPOCH = 30                # epoch of the checkpoint we're continuing from
+TARGET_CONSECUTIVE = 2        
+CUMULATIVE_EPOCH_CAP = 150     
+START_EPOCH = 30              
 
 NUM_TRAIN_TRIALS = 5000
 NUM_VAL_TRIALS = 500
 BATCH_SIZE = 64
-LEARNING_RATE = 3e-4             # same preservation regime as the matched-effort sweep
+LEARNING_RATE = 3e-4            
 
 DEVICE = 'cpu'
 CK_ROOT = 'experiments/checkpoints'
@@ -61,9 +46,6 @@ def continue_one(lam, seed):
     train_loader = DataLoader(TrialDataset(X_train, Y_train), batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(TrialDataset(X_val, Y_val), batch_size=BATCH_SIZE, shuffle=False)
 
-    # Restore model AND optimizer so the continuation is a true resume (Adam
-    # first/second moment estimates preserved — otherwise we'd be restarting
-    # momentum and the "same recipe" claim breaks).
     torch.manual_seed(seed)
     model = VanillaRNN(input_size=33, hidden_size=128, output_size=3).to(DEVICE)
     ck = torch.load(resume_ck, map_location=DEVICE, weights_only=False)
@@ -72,13 +54,11 @@ def continue_one(lam, seed):
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     if 'optimizer_state_dict' in ck:
         optimizer.load_state_dict(ck['optimizer_state_dict'])
-        # ensure lr matches what we want now (in case baseline used a different lr)
         for g in optimizer.param_groups:
             g['lr'] = LEARNING_RATE
 
     loss_function = nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))
 
-    # --- Pull prior history so we produce a single end-to-end curve per run ---
     hist_path = os.path.join(run_dir, 'training_history.npz')
     prior = np.load(hist_path) if os.path.exists(hist_path) else None
     history = {k: list(prior[k]) if prior is not None else []
@@ -148,11 +128,10 @@ def continue_one(lam, seed):
                 'W_ih': model.W_in.weight.detach().cpu().numpy(),
             }, os.path.join(run_dir, 'target95.pt'))
             print(f"[{tag}] *** hit target 95% at cumulative epoch {epoch} ***", flush=True)
-            break   # matched-accuracy: stop as soon as we hit target
+            break 
 
     dt = time.time() - t0
 
-    # Refresh history + hidden states at whichever checkpoint we'll use downstream
     np.savez(hist_path, **{k: np.array(v) for k, v in history.items()})
     np.savez(os.path.join(run_dir, 'target_meta.npz'),
              target_acc=TARGET_ACC, target_epoch=(target_epoch if target_epoch else np.nan),
