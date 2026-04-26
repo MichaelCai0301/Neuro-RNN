@@ -1,14 +1,4 @@
-"""Fine-tune sweep: fork each baseline lam=0 checkpoint into new-lambda specialists.
 
-Starts from experiments/checkpoints/lam0_seed{s}/epoch_100.pt (already trained to
-~99% val decision accuracy) and retrains at lambda in {2, 4, 6, 8, 10} with a
-conservative lr so the baseline representation is preserved (lineage intact for
-cross-network analysis).
-
-Outputs land under experiments/checkpoints/finetuned_lam{L}_seed{s}/ with the
-same layout as the original sweep (epoch_*.pt, training_history.npz,
-hidden_states_val.npy).
-"""
 
 import os
 import sys
@@ -26,7 +16,6 @@ from rnn_model import (
 NEW_LAMBDAS = [2, 4, 6, 8, 10]
 SEEDS = [0, 1, 2]
 
-# Preserving-baseline regime: ~7x smaller Adam budget than the original sweep.
 NUM_TRAIN_TRIALS = 5000
 NUM_VAL_TRIALS = 500
 BATCH_SIZE = 64
@@ -35,7 +24,7 @@ LEARNING_RATE = 3e-4
 HIDDEN_SIZE = 128
 CHECKPOINT_EVERY = 10
 
-DEVICE = 'cpu'  # match original sweep; MPS+multi-run is single-stream bottleneck
+DEVICE = 'cpu' 
 BASELINE_DIR = 'experiments/checkpoints'
 OUT_DIR = 'experiments/checkpoints'
 
